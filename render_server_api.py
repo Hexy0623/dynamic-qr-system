@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-简化版Render服务器 - 确保兼容性
+带API功能的Render服务器 - 支持本地管理器
 """
 
 import os
@@ -56,8 +56,8 @@ class SimpleQRConfig:
         }
         self.save_config()
 
-# HTTP请求处理器
-class SimpleQRHandler(http.server.BaseHTTPRequestHandler):
+# HTTP请求处理器（带API）
+class QRAPIHandler(http.server.BaseHTTPRequestHandler):
     def __init__(self, *args, config_manager=None, **kwargs):
         self.config_manager = config_manager or SimpleQRConfig()
         super().__init__(*args, **kwargs)
@@ -75,7 +75,7 @@ class SimpleQRHandler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_error(404)
         except Exception as e:
-            print(f"请求处理错误: {e}")
+            print(f"GET请求处理错误: {e}")
             self.send_error(500)
     
     def do_POST(self):
@@ -83,17 +83,22 @@ class SimpleQRHandler(http.server.BaseHTTPRequestHandler):
         try:
             if self.path == '/api/qr':
                 self.handle_create_qr()
-            elif self.path.startswith('/api/qr/'):
-                qr_id = self.path.split('/')[-1]
-                if '/status' in self.path:
-                    self.handle_update_status(qr_id)
-                else:
-                    self.send_error(404)
+            elif self.path.startswith('/api/qr/') and '/status' in self.path:
+                qr_id = self.path.split('/')[-2]  # /api/qr/{id}/status
+                self.handle_update_status(qr_id)
             else:
                 self.send_error(404)
         except Exception as e:
             print(f"POST请求处理错误: {e}")
             self.send_error(500)
+    
+    def do_OPTIONS(self):
+        """处理OPTIONS请求（CORS预检）"""
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
     
     def send_status_page(self):
         """发送状态页面"""
@@ -116,6 +121,7 @@ class SimpleQRHandler(http.server.BaseHTTPRequestHandler):
                 h1 {{ color: #2c3e50; text-align: center; }}
                 .status {{ background: #d4edda; color: #155724; padding: 15px; border-radius: 5px; margin: 20px 0; }}
                 .info {{ background: #f8f9fa; padding: 15px; border-radius: 5px; }}
+                .api {{ background: #e7f3ff; padding: 15px; border-radius: 5px; margin: 20px 0; }}
             </style>
         </head>
         <body>
@@ -130,12 +136,112 @@ class SimpleQRHandler(http.server.BaseHTTPRequestHandler):
                     <p>• 服务器状态: 在线</p>
                     <p>• 更新时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
                 </div>
+                <div class="api">
+                    <p><strong>🔌 API接口</strong></p>
+                    <p>• GET /api/qr - 获取二维码列表</p>
+                    <p>• POST /api/qr - 创建新二维码</p>
+                    <p>• POST /api/qr/{{id}}/status - 更新状态</p>
+                </div>
             </div>
         </body>
         </html>
         '''
         
         self.wfile.write(html.encode('utf-8'))
+    
+    def send_qr_list(self):
+        """发送二维码列表API"""
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json; charset=utf-8')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        
+        response_data = {
+            "status": "success",
+            "data": self.config_manager.data.get("qr_codes", {})
+        }
+        
+        self.wfile.write(json.dumps(response_data, ensure_ascii=False, indent=2).encode('utf-8'))
+    
+    def handle_create_qr(self):
+        """处理创建二维码API"""
+        try:
+            # 读取POST数据
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            
+            # 提取参数
+            qr_id = data.get('qr_id')
+            email = data.get('email')
+            subject = data.get('subject', '')
+            body = data.get('body', '')
+            cc = data.get('cc', '')
+            
+            if not qr_id or not email:
+                self.send_error(400, "缺少必要参数")
+                return
+            
+            # 添加二维码
+            self.config_manager.add_qr(qr_id, email, subject, body, cc)
+            
+            # 返回成功响应
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json; charset=utf-8')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            
+            response_data = {
+                "status": "success",
+                "message": "二维码创建成功",
+                "qr_id": qr_id
+            }
+            
+            self.wfile.write(json.dumps(response_data, ensure_ascii=False).encode('utf-8'))
+            print(f"✅ 创建二维码: {qr_id[:8]}... -> {email}")
+            
+        except Exception as e:
+            print(f"创建二维码错误: {e}")
+            self.send_error(500, f"创建失败: {str(e)}")
+    
+    def handle_update_status(self, qr_id):
+        """处理更新状态API"""
+        try:
+            # 读取POST数据
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            
+            status = data.get('status')
+            if not status:
+                self.send_error(400, "缺少状态参数")
+                return
+            
+            # 更新状态
+            qr_codes = self.config_manager.data.get("qr_codes", {})
+            if qr_id in qr_codes:
+                qr_codes[qr_id]["status"] = status
+                self.config_manager.save_config()
+                
+                # 返回成功响应
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json; charset=utf-8')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                
+                response_data = {
+                    "status": "success",
+                    "message": f"状态更新为: {status}"
+                }
+                
+                self.wfile.write(json.dumps(response_data, ensure_ascii=False).encode('utf-8'))
+                print(f"📝 更新状态: {qr_id[:8]}... -> {status}")
+            else:
+                self.send_error(404, "二维码不存在")
+                
+        except Exception as e:
+            print(f"更新状态错误: {e}")
+            self.send_error(500, f"更新失败: {str(e)}")
     
     def handle_qr_request(self, qr_id):
         """处理二维码请求"""
@@ -167,6 +273,9 @@ class SimpleQRHandler(http.server.BaseHTTPRequestHandler):
         
         if params:
             mailto_url += "?" + "&".join(params)
+        
+        # 记录访问
+        print(f"📱 二维码访问: {qr_id[:8]}... -> {email}")
         
         # 重定向到邮件客户端
         self.send_response(302)
@@ -208,31 +317,21 @@ def main():
     host = os.environ.get('HOST', '0.0.0.0')
     port = int(os.environ.get('PORT', 10000))
     
-    print(f"🌐 简化版动态二维码服务器")
+    print(f"🌐 动态二维码服务器 (带API)")
     print(f"📡 监听地址: {host}:{port}")
     
     # 创建配置管理器
     config_manager = SimpleQRConfig()
     
-    # 创建测试二维码（如果不存在）
-    if not config_manager.data.get("qr_codes"):
-        test_id = str(uuid.uuid4())
-        config_manager.add_qr(
-            test_id,
-            "test@example.com",
-            "测试邮件",
-            "这是一个测试二维码"
-        )
-        print(f"✅ 创建测试二维码: {test_id}")
-    
     # 创建HTTP处理器
     def handler(*args, **kwargs):
-        SimpleQRHandler(*args, config_manager=config_manager, **kwargs)
+        QRAPIHandler(*args, config_manager=config_manager, **kwargs)
     
     try:
         with socketserver.TCPServer((host, port), handler) as httpd:
             print(f"✅ 服务器启动成功")
             print(f"🔗 访问地址: http://{host}:{port}")
+            print(f"🔌 API地址: http://{host}:{port}/api/qr")
             httpd.serve_forever()
     except Exception as e:
         print(f"❌ 服务器启动失败: {e}")

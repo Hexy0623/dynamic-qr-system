@@ -90,11 +90,27 @@ class CloudQRManager:
     def sync_to_cloud(self, qr_id, email, subject, body, cc):
         """同步数据到云端服务器"""
         try:
-            # 这里可以添加API调用来同步数据到云端
-            # 目前云端服务器使用本地JSON文件，所以这个功能暂时保留
-            print(f"二维码 {qr_id[:8]} 已创建，云端URL: {self.cloud_url}/qr/{qr_id}")
+            # 调用云端API创建二维码
+            api_url = f"{self.cloud_url}/api/qr"
+            data = {
+                "qr_id": qr_id,
+                "email": email,
+                "subject": subject,
+                "body": body,
+                "cc": cc
+            }
+            
+            response = requests.post(api_url, json=data, timeout=10)
+            if response.status_code == 200:
+                print(f"✅ 云端同步成功: {qr_id[:8]}... -> {email}")
+                return True
+            else:
+                print(f"⚠️ 云端同步失败: HTTP {response.status_code}")
+                return False
+                
         except Exception as e:
-            print(f"云端同步失败: {e}")
+            print(f"❌ 云端同步错误: {e}")
+            return False
     
     def get_all_qr_codes(self):
         """获取所有二维码"""
@@ -103,10 +119,32 @@ class CloudQRManager:
     def update_qr_status(self, qr_id, status):
         """更新二维码状态"""
         if qr_id in self.config_data["qr_codes"]:
+            # 更新本地状态
             self.config_data["qr_codes"][qr_id]["status"] = status
             self.save_config()
+            
+            # 同步到云端
+            self.sync_status_to_cloud(qr_id, status)
             return True
         return False
+    
+    def sync_status_to_cloud(self, qr_id, status):
+        """同步状态到云端"""
+        try:
+            api_url = f"{self.cloud_url}/api/qr/{qr_id}/status"
+            data = {"status": status}
+            
+            response = requests.post(api_url, json=data, timeout=10)
+            if response.status_code == 200:
+                print(f"✅ 状态同步成功: {qr_id[:8]}... -> {status}")
+                return True
+            else:
+                print(f"⚠️ 状态同步失败: HTTP {response.status_code}")
+                return False
+                
+        except Exception as e:
+            print(f"❌ 状态同步错误: {e}")
+            return False
     
     def test_cloud_connection(self):
         """测试云端连接"""
