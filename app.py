@@ -14,12 +14,73 @@ import socketserver
 import urllib.parse
 from datetime import datetime
 
+# 尝试导入PostgreSQL支持
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    POSTGRES_AVAILABLE = True
+except ImportError:
+    POSTGRES_AVAILABLE = False
+    print("⚠️  PostgreSQL支持未安装，使用文件存储模式")
+
 class QRConfigManager:
-    """二维码配置管理器"""
+    """持久化二维码配置管理器"""
     
     def __init__(self):
+        self.database_url = os.environ.get('DATABASE_URL')
+        self.use_postgres = POSTGRES_AVAILABLE and self.database_url
         self.config_file = "qr_data.json"
-        self.data = self.load_config()
+        
+        if self.use_postgres:
+            print("🗄️  使用PostgreSQL数据库存储")
+            self.init_database()
+        else:
+            print("📁 使用JSON文件存储")
+            self.data = self.load_config()
+    
+    def init_database(self):
+        """初始化数据库表"""
+        try:
+            with psycopg2.connect(self.database_url) as conn:
+                with conn.cursor() as cursor:
+                    # 创建二维码表
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS qr_codes (
+                            id VARCHAR(255) PRIMARY KEY,
+                            email VARCHAR(255) NOT NULL,
+                            subject TEXT DEFAULT '',
+                            body TEXT DEFAULT '',
+                            cc VARCHAR(255) DEFAULT '',
+                            status VARCHAR(20) DEFAULT 'active',
+                            scan_count INTEGER DEFAULT 0,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            last_scan TIMESTAMP
+                        )
+                    """)
+                    
+                    # 创建统计表
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS stats (
+                            key VARCHAR(50) PRIMARY KEY,
+                            value INTEGER DEFAULT 0,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    
+                    # 初始化统计数据
+                    cursor.execute("""
+                        INSERT INTO stats (key, value) VALUES ('total_scans', 0), ('total_qrs', 0)
+                        ON CONFLICT (key) DO NOTHING
+                    """)
+                    
+                    conn.commit()
+                    print("✅ 数据库表初始化完成")
+                    
+        except Exception as e:
+            print(f"❌ 数据库初始化失败: {e}")
+            print("📁 降级到文件存储模式")
+            self.use_postgres = False
+            self.data = self.load_config()
     
     def load_config(self):
         """加载配置"""
@@ -33,53 +94,169 @@ class QRConfigManager:
     
     def save_config(self):
         """保存配置"""
-        try:
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"配置保存失败: {e}")
+        if not self.use_postgres:
+            try:
+                with open(self.config_file, 'w', encoding='utf-8') as f:
+                    json.dump(self.data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"配置保存失败: {e}")
     
     def get_qr_data(self, qr_id):
         """获取二维码数据"""
-        return self.data.get("qr_codes", {}).get(qr_id)
+        if self.use_postgres:
+            try:
+                with psycopg2.connect(self.database_url) as conn:
+                    with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                        cursor.execute("SELECT * FROM qr_codes WHERE id = %s", (qr_id,))
+                        result = cursor.fetchone()
+                        return dict(result) if result else None
+            except Exception as e:
+                print(f"数据库查询失败: {e}")
+                return None
+        else:
+            return self.data.get("qr_codes", {}).get(qr_id)
     
     def add_qr(self, qr_id, email, subject="", body="", cc=""):
         """添加二维码"""
-        if "qr_codes" not in self.data:
-            self.data["qr_codes"] = {}
-        
-        self.data["qr_codes"][qr_id] = {
-            "email": email,
-            "subject": subject,
-            "body": body,
-            "cc": cc,
-            "status": "active",
-            "scan_count": 0,
-            "created_at": datetime.now().isoformat(),
-            "last_scan": None
-        }
-        
-        # 更新统计
-        self.data.setdefault("stats", {})["total_qrs"] = len(self.data["qr_codes"])
-        self.save_config()
-        print(f"✅ 添加二维码: {qr_id[:8]}... -> {email}")
+        if self.use_postgres:
+            try:
+                with psycopg2.connect(self.database_url) as conn:
+                    with conn.cursor() as cursor:
+                        # 插入二维码记录
+                        cursor.execute("""
+                            INSERT INTO qr_codes (id, email, subject, body, cc, status, scan_count, created_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (id) DO UPDATE SET
+                                email = EXCLUDED.email,
+                                subject = EXCLUDED.subject,
+                                body = EXCLUDED.body,
+                                cc = EXCLUDED.cc,
+                                status = EXCLUDED.status
+                        """, (qr_id, email, subject, body, cc, "active", 0, datetime.now()))
+                        
+                        # 更新总数统计
+                        cursor.execute("""
+                            INSERT INTO stats (key, value) VALUES ('total_qrs', 1)
+                            ON CONFLICT (key) DO UPDATE SET 
+                                value = (SELECT COUNT(*) FROM qr_codes),
+                                updated_at = CURRENT_TIMESTAMP
+                        """)
+                        
+                        conn.commit()
+                        print(f"✅ 数据库添加二维码: {qr_id[:8]}... -> {email}")
+                        
+            except Exception as e:
+                print(f"数据库添加失败: {e}")
+        else:
+            # JSON文件存储
+            if "qr_codes" not in self.data:
+                self.data["qr_codes"] = {}
+            
+            self.data["qr_codes"][qr_id] = {
+                "email": email,
+                "subject": subject,
+                "body": body,
+                "cc": cc,
+                "status": "active",
+                "scan_count": 0,
+                "created_at": datetime.now().isoformat(),
+                "last_scan": None
+            }
+            
+            self.data.setdefault("stats", {})["total_qrs"] = len(self.data["qr_codes"])
+            self.save_config()
+            print(f"✅ 文件添加二维码: {qr_id[:8]}... -> {email}")
     
     def update_status(self, qr_id, status):
         """更新二维码状态"""
-        if qr_id in self.data.get("qr_codes", {}):
-            self.data["qr_codes"][qr_id]["status"] = status
-            self.save_config()
-            print(f"📝 状态更新: {qr_id[:8]}... -> {status}")
-            return True
-        return False
+        if self.use_postgres:
+            try:
+                with psycopg2.connect(self.database_url) as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute(
+                            "UPDATE qr_codes SET status = %s WHERE id = %s",
+                            (status, qr_id)
+                        )
+                        
+                        if cursor.rowcount > 0:
+                            conn.commit()
+                            print(f"📝 数据库状态更新: {qr_id[:8]}... -> {status}")
+                            return True
+                        return False
+                        
+            except Exception as e:
+                print(f"数据库更新失败: {e}")
+                return False
+        else:
+            # JSON文件存储
+            if qr_id in self.data.get("qr_codes", {}):
+                self.data["qr_codes"][qr_id]["status"] = status
+                self.save_config()
+                print(f"📝 文件状态更新: {qr_id[:8]}... -> {status}")
+                return True
+            return False
     
     def record_scan(self, qr_id):
         """记录扫描"""
-        if qr_id in self.data.get("qr_codes", {}):
-            self.data["qr_codes"][qr_id]["scan_count"] += 1
-            self.data["qr_codes"][qr_id]["last_scan"] = datetime.now().isoformat()
-            self.data.setdefault("stats", {})["total_scans"] = self.data["stats"].get("total_scans", 0) + 1
-            self.save_config()
+        if self.use_postgres:
+            try:
+                with psycopg2.connect(self.database_url) as conn:
+                    with conn.cursor() as cursor:
+                        # 更新二维码扫描计数
+                        cursor.execute("""
+                            UPDATE qr_codes 
+                            SET scan_count = scan_count + 1, last_scan = %s 
+                            WHERE id = %s
+                        """, (datetime.now(), qr_id))
+                        
+                        # 更新总扫描统计
+                        cursor.execute("""
+                            UPDATE stats 
+                            SET value = value + 1, updated_at = CURRENT_TIMESTAMP 
+                            WHERE key = 'total_scans'
+                        """)
+                        
+                        conn.commit()
+                        
+            except Exception as e:
+                print(f"数据库扫描记录失败: {e}")
+        else:
+            # JSON文件存储
+            if qr_id in self.data.get("qr_codes", {}):
+                self.data["qr_codes"][qr_id]["scan_count"] += 1
+                self.data["qr_codes"][qr_id]["last_scan"] = datetime.now().isoformat()
+                self.data.setdefault("stats", {})["total_scans"] = self.data["stats"].get("total_scans", 0) + 1
+                self.save_config()
+    
+    def get_all_qr_codes(self):
+        """获取所有二维码"""
+        if self.use_postgres:
+            try:
+                with psycopg2.connect(self.database_url) as conn:
+                    with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                        cursor.execute("SELECT * FROM qr_codes ORDER BY created_at DESC")
+                        results = cursor.fetchall()
+                        return {row['id']: dict(row) for row in results}
+            except Exception as e:
+                print(f"数据库查询失败: {e}")
+                return {}
+        else:
+            return self.data.get("qr_codes", {})
+    
+    def get_stats(self):
+        """获取统计信息"""
+        if self.use_postgres:
+            try:
+                with psycopg2.connect(self.database_url) as conn:
+                    with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                        cursor.execute("SELECT key, value FROM stats")
+                        results = cursor.fetchall()
+                        return {row['key']: row['value'] for row in results}
+            except Exception as e:
+                print(f"数据库统计查询失败: {e}")
+                return {"total_scans": 0, "total_qrs": 0}
+        else:
+            return self.data.get("stats", {"total_scans": 0, "total_qrs": 0})
 
 class QRHandler(http.server.BaseHTTPRequestHandler):
     """HTTP请求处理器"""
@@ -140,9 +317,10 @@ class QRHandler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
         
-        stats = self.config_manager.data.get("stats", {})
-        qr_count = len(self.config_manager.data.get("qr_codes", {}))
+        stats = self.config_manager.get_stats()
+        qr_count = stats.get("total_qrs", 0)
         total_scans = stats.get("total_scans", 0)
+        storage_type = "PostgreSQL数据库" if self.config_manager.use_postgres else "JSON文件"
         
         html = f'''
         <!DOCTYPE html>
@@ -171,8 +349,18 @@ class QRHandler(http.server.BaseHTTPRequestHandler):
         <body>
             <div class="container">
                 <div class="header">
-                    <h1>🌐 动态二维码系统</h1>
-                    <p>云端服务器控制台 | 运行时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+                    <h1>🌐 动态二维码系统 v3.0</h1>
+                    <p>持久化云端服务器控制台 | 运行时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+                </div>
+                
+                <div class="storage-info" style="background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); margin-bottom: 20px;">
+                    <h3>🗄️ 存储系统</h3>
+                    <span class="storage-badge" style="display: inline-block; padding: 8px 16px; border-radius: 20px; font-size: 0.9em; font-weight: bold; {'background: #e6fffa; color: #234e52;' if self.config_manager.use_postgres else 'background: #fef5e7; color: #744210;'}">
+                        {storage_type}
+                    </span>
+                    <p style="margin-top: 10px; color: #718096;">
+                        {'✅ 数据完全持久化，服务重启不会丢失' if self.config_manager.use_postgres else '⚠️ 临时文件存储，重启可能丢失数据'}
+                    </p>
                 </div>
                 
                 <div class="stats">
@@ -238,11 +426,14 @@ class QRHandler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-type', 'application/json')
         self.end_headers()
         
+        stats = self.config_manager.get_stats()
         health_data = {
             "status": "healthy",
             "timestamp": datetime.now().isoformat(),
-            "version": "2.0",
-            "qr_count": len(self.config_manager.data.get("qr_codes", {}))
+            "version": "3.0-persistent",
+            "storage_type": "postgresql" if self.config_manager.use_postgres else "json",
+            "qr_count": stats.get("total_qrs", 0),
+            "total_scans": stats.get("total_scans", 0)
         }
         
         self.wfile.write(json.dumps(health_data).encode('utf-8'))
@@ -328,10 +519,12 @@ class QRHandler(http.server.BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         
+        qr_codes = self.config_manager.get_all_qr_codes()
         response_data = {
             "status": "success",
-            "data": self.config_manager.data.get("qr_codes", {}),
-            "count": len(self.config_manager.data.get("qr_codes", {}))
+            "data": qr_codes,
+            "count": len(qr_codes),
+            "storage_type": "postgresql" if self.config_manager.use_postgres else "json"
         }
         
         self.wfile.write(json.dumps(response_data, ensure_ascii=False, indent=2).encode('utf-8'))
@@ -343,11 +536,12 @@ class QRHandler(http.server.BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         
-        stats = self.config_manager.data.get("stats", {})
+        stats = self.config_manager.get_stats()
         response_data = {
             "status": "success",
             "stats": stats,
-            "qr_count": len(self.config_manager.data.get("qr_codes", {})),
+            "qr_count": stats.get("total_qrs", 0),
+            "storage_type": "postgresql" if self.config_manager.use_postgres else "json",
             "timestamp": datetime.now().isoformat()
         }
         
@@ -385,7 +579,8 @@ class QRHandler(http.server.BaseHTTPRequestHandler):
                 "status": "success",
                 "message": "二维码创建成功",
                 "qr_id": qr_id,
-                "qr_url": f"/qr/{qr_id}"
+                "qr_url": f"/qr/{qr_id}",
+                "storage_type": "postgresql" if self.config_manager.use_postgres else "json"
             }
             
             self.wfile.write(json.dumps(response_data, ensure_ascii=False).encode('utf-8'))
@@ -419,7 +614,8 @@ class QRHandler(http.server.BaseHTTPRequestHandler):
                 response_data = {
                     "status": "success",
                     "message": f"状态已更新为: {status}",
-                    "qr_id": qr_id
+                    "qr_id": qr_id,
+                    "storage_type": "postgresql" if self.config_manager.use_postgres else "json"
                 }
                 
                 self.wfile.write(json.dumps(response_data, ensure_ascii=False).encode('utf-8'))
@@ -438,8 +634,8 @@ def main():
     host = os.environ.get('HOST', '0.0.0.0')
     port = int(os.environ.get('PORT', 10000))
     
-    print("🌐 动态二维码系统服务器 v2.0")
-    print("=" * 50)
+    print("🌐 动态二维码系统服务器 v3.0 (持久化版本)")
+    print("=" * 60)
     print(f"📡 监听地址: {host}:{port}")
     print(f"🕒 启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
@@ -456,7 +652,11 @@ def main():
             print(f"✅ 服务器启动成功")
             print(f"🔗 控制台: http://{host}:{port}")
             print(f"🔌 API基址: http://{host}:{port}/api")
-            print(f"📊 当前管理 {len(config_manager.data.get('qr_codes', {}))} 个二维码")
+            
+            stats = config_manager.get_stats()
+            print(f"📊 当前管理 {stats.get('total_qrs', 0)} 个二维码")
+            print(f"📈 总扫描次数 {stats.get('total_scans', 0)} 次")
+            print(f"🗄️  存储模式: {'PostgreSQL数据库' if config_manager.use_postgres else 'JSON文件'}")
             print("🔄 服务器运行中...")
             
             httpd.serve_forever()
@@ -469,3 +669,5 @@ def main():
 
 if __name__ == "__main__":
     exit(main())
+
+
